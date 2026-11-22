@@ -1,0 +1,4 @@
+# cmd.exe mis-parses long call/if chains when a .bat file uses LF-only line
+# endings (e.g. "The input line is too long"). Force CRLF on checkout,
+# independent of the user's core.autocrlf setting.
+*.bat text eol=crlf

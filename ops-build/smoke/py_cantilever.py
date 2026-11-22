@@ -1,0 +1,17 @@
+import opensees as ops
+E, I, L, P = 29000.0, 100.0, 1.0, 1.0
+ops.model('basic', '-ndm', 2, '-ndf', 3)
+ops.node(1, 0.0, 0.0); ops.node(2, L, 0.0)
+ops.fix(1, 1, 1, 1)
+ops.geomTransf('Linear', 1)
+ops.element('elasticBeamColumn', 1, 1, 2, 1.0, E, I, 1)
+ops.timeSeries('Constant', 1)
+ops.pattern('Plain', 1, 1)
+ops.load(2, 0.0, P, 0.0)
+ops.system('UmfPack'); ops.numberer('RCM'); ops.constraints('Plain')
+ops.integrator('LoadControl', 1.0); ops.algorithm('Linear'); ops.analysis('Static')
+ops.analyze(1)
+dy = ops.nodeDisp(2, 2); rot = ops.nodeDisp(2, 3)
+print("PY disp_y = %.6e  exact = %.6e  relerr = %.2e" % (dy, P*L**3/(3*E*I), abs(dy - P*L**3/(3*E*I))/(P*L**3/(3*E*I))))
+print("PY rot    = %.6e  exact = %.6e  relerr = %.2e" % (rot, P*L**2/(2*E*I), abs(rot - P*L**2/(2*E*I))/(P*L**2/(2*E*I))))
+print("PY version:", ops.version())
