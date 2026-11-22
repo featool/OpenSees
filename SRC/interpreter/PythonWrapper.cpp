@@ -940,6 +940,234 @@ static PyObject *Py_ops_eleResponse(PyObject *self, PyObject *args)
     return wrapper->getResults();
 }
 
+// Batch version of eleResponse.
+//
+//   sizes, data = ops.eleGaussResponse(eleTags, *responseArgs)
+//
+// responseArgs are exactly the arguments eleResponse() takes after the tag:
+//   eleGaussResponse(tags, "stresses")
+//   eleGaussResponse(tags, "Material", gp, "fiber", n, "stresses")
+// sizes[i] is the number of doubles element i returned (0 when the element
+// does not exist or does not provide the response), data is a bytes object
+// with the raw float64 values of all elements in tag order.  numpy can wrap
+// the buffer without copying: np.frombuffer(data, dtype=np.float64).
+static PyObject *Py_ops_eleGaussResponse(PyObject *self, PyObject *args)
+{
+    const Py_ssize_t numArgs = PyTuple_Size(args);
+    if (numArgs < 2) {
+	PyErr_SetString(PyExc_TypeError,
+			"eleGaussResponse() wants: eleGaussResponse(eleTags, "
+			"responseArgs...) - the response arguments are the same "
+			"as in eleResponse(eleTag, responseArgs...)");
+	return NULL;
+    }
+
+    PyObject *tagObj = PyTuple_GetItem(args, 0);
+
+    PyObject *seq = PySequence_Fast(tagObj,
+		"eleGaussResponse(): eleTags must be a sequence of integer tags");
+    if (seq == NULL)
+	return NULL;
+
+    const Py_ssize_t numTags = PySequence_Fast_GET_SIZE(seq);
+    std::vector<int> tags;
+    tags.reserve((std::size_t)(numTags > 0 ? numTags : 0));
+    for (Py_ssize_t i = 0; i < numTags; i++) {
+	PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+	long tag = PyLong_AsLong(item);
+	if (tag == -1 && PyErr_Occurred()) {
+	    Py_DECREF(seq);
+	    PyErr_SetString(PyExc_TypeError,
+			    "eleGaussResponse(): element tags must be integers");
+	    return NULL;
+	}
+	tags.push_back((int)tag);
+    }
+    Py_DECREF(seq);
+
+    // Pass the response arguments through the same conversion eleResponse()
+    // uses: strings as-is, integers as "%d", floats as "%.20f".
+    std::vector<std::string> argStrings;
+    argStrings.reserve((std::size_t)(numArgs - 1));
+    for (Py_ssize_t i = 1; i < numArgs; i++) {
+	PyObject *item = PyTuple_GetItem(args, i);
+	if (PyUnicode_Check(item)) {
+	    const char *text = PyUnicode_AsUTF8(item);
+	    if (text == NULL)
+		return NULL;
+	    argStrings.push_back(std::string(text));
+	} else if (PyLong_Check(item) || PyBool_Check(item)) {
+	    long value = PyLong_AsLong(item);
+	    if (value == -1 && PyErr_Occurred())
+		return NULL;
+	    char buffer[32];
+	    snprintf(buffer, sizeof(buffer), "%ld", value);
+	    argStrings.push_back(std::string(buffer));
+	} else if (PyFloat_Check(item)) {
+	    double value = PyFloat_AsDouble(item);
+	    if (value == -1.0 && PyErr_Occurred())
+		return NULL;
+	    char buffer[64];
+	    snprintf(buffer, sizeof(buffer), "%.20f", value);
+	    argStrings.push_back(std::string(buffer));
+	} else {
+	    PyErr_SetString(PyExc_TypeError,
+			    "eleGaussResponse(): response arguments must be "
+			    "strings, integers or floats");
+	    return NULL;
+	}
+    }
+
+    std::vector<const char *> argv;
+    argv.reserve(argStrings.size());
+    for (std::size_t i = 0; i < argStrings.size(); i++)
+	argv.push_back(argStrings[i].c_str());
+
+    std::vector<int> sizes;
+    std::vector<double> data;
+    if (OPS_GetElementGaussResponse(tags, argv.empty() ? 0 : &argv[0],
+				    (int)argv.size(), sizes, data) < 0) {
+	PyErr_SetString(PyExc_RuntimeError,
+			"eleGaussResponse(): failed to read the element responses");
+	return NULL;
+    }
+
+    PyObject *sizeList = PyList_New((Py_ssize_t)sizes.size());
+    if (sizeList == NULL)
+	return NULL;
+    for (std::size_t i = 0; i < sizes.size(); i++) {
+	PyObject *value = PyLong_FromLong(sizes[i]);
+	if (value == NULL) {
+	    Py_DECREF(sizeList);
+	    return NULL;
+	}
+	PyList_SET_ITEM(sizeList, (Py_ssize_t)i, value);
+    }
+
+    const char *buffer = data.empty() ? "" : (const char *)&data[0];
+    PyObject *bytes = PyBytes_FromStringAndSize(buffer,
+			(Py_ssize_t)(data.size() * sizeof(double)));
+    if (bytes == NULL) {
+	Py_DECREF(sizeList);
+	return NULL;
+    }
+
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+	Py_DECREF(sizeList);
+	Py_DECREF(bytes);
+	return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, sizeList);
+    PyTuple_SET_ITEM(result, 1, bytes);
+    return result;
+}
+
+// C++ side gauss -> node projection.
+//
+//   nodeTags, values = ops.eleGaussToNodes(eleTags, variable[, fiber])
+//
+// variable : "stresses" | "strains" (same keyword as eleResponse)
+// fiber    : 0 (default) = section response, > 0 = fiber index
+// nodeTags : node tags in first-appearance order
+// values   : bytes, float64, one row of numComp components per node
+static PyObject *Py_ops_eleGaussToNodes(PyObject *self, PyObject *args)
+{
+    const Py_ssize_t numArgs = PyTuple_Size(args);
+    if (numArgs < 2 || numArgs > 3) {
+	PyErr_SetString(PyExc_TypeError,
+			"eleGaussToNodes() wants: "
+			"eleGaussToNodes(eleTags, variable[, fiber])");
+	return NULL;
+    }
+
+    PyObject *tagObj = PyTuple_GetItem(args, 0);
+    PyObject *varObj = PyTuple_GetItem(args, 1);
+    if (!PyUnicode_Check(varObj)) {
+	PyErr_SetString(PyExc_TypeError,
+			"eleGaussToNodes(): variable must be a string");
+	return NULL;
+    }
+    const char *variable = PyUnicode_AsUTF8(varObj);
+    if (variable == NULL)
+	return NULL;
+
+    long fiber = 0;
+    if (numArgs == 3) {
+	PyObject *fiberObj = PyTuple_GetItem(args, 2);
+	fiber = PyLong_AsLong(fiberObj);
+	if ((fiber == -1 && PyErr_Occurred()) || fiber < 0) {
+	    PyErr_SetString(PyExc_TypeError,
+			    "eleGaussToNodes(): fiber must be a non-negative integer");
+	    return NULL;
+	}
+    }
+
+    PyObject *seq = PySequence_Fast(tagObj,
+		"eleGaussToNodes(): eleTags must be a sequence of integer tags");
+    if (seq == NULL)
+	return NULL;
+
+    const Py_ssize_t numTags = PySequence_Fast_GET_SIZE(seq);
+    std::vector<int> tags;
+    tags.reserve((std::size_t)(numTags > 0 ? numTags : 0));
+    for (Py_ssize_t i = 0; i < numTags; i++) {
+	PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+	long tag = PyLong_AsLong(item);
+	if (tag == -1 && PyErr_Occurred()) {
+	    Py_DECREF(seq);
+	    PyErr_SetString(PyExc_TypeError,
+			    "eleGaussToNodes(): element tags must be integers");
+	    return NULL;
+	}
+	tags.push_back((int)tag);
+    }
+    Py_DECREF(seq);
+
+    std::vector<int> nodeTags;
+    std::vector<double> values;
+    int numComp = 0;
+    int skipped = 0;
+    if (OPS_GetGaussToNodes(tags, variable, (int)fiber,
+			    nodeTags, values, numComp, skipped) < 0) {
+	PyErr_SetString(PyExc_RuntimeError,
+			"eleGaussToNodes(): failed to project the element responses");
+	return NULL;
+    }
+    (void)numComp;
+    (void)skipped;
+
+    PyObject *nodeList = PyList_New((Py_ssize_t)nodeTags.size());
+    if (nodeList == NULL)
+	return NULL;
+    for (std::size_t i = 0; i < nodeTags.size(); i++) {
+	PyObject *value = PyLong_FromLong(nodeTags[i]);
+	if (value == NULL) {
+	    Py_DECREF(nodeList);
+	    return NULL;
+	}
+	PyList_SET_ITEM(nodeList, (Py_ssize_t)i, value);
+    }
+
+    const char *buffer = values.empty() ? "" : (const char *)&values[0];
+    PyObject *bytes = PyBytes_FromStringAndSize(buffer,
+			(Py_ssize_t)(values.size() * sizeof(double)));
+    if (bytes == NULL) {
+	Py_DECREF(nodeList);
+	return NULL;
+    }
+
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+	Py_DECREF(nodeList);
+	Py_DECREF(bytes);
+	return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, nodeList);
+    PyTuple_SET_ITEM(result, 1, bytes);
+    return result;
+}
+
 static PyObject *Py_ops_SP(PyObject *self, PyObject *args)
 {
     wrapper->resetCommandLine(PyTuple_Size(args), 1, args);
@@ -3137,6 +3365,8 @@ PythonWrapper::addOpenSeesCommands()
     addCommand("getTime", &Py_ops_getTime);
     addCommand("setCreep", &Py_ops_setCreep);
     addCommand("eleResponse", &Py_ops_eleResponse);
+    addCommand("eleGaussResponse", &Py_ops_eleGaussResponse);
+    addCommand("eleGaussToNodes", &Py_ops_eleGaussToNodes);
     addCommand("sp", &Py_ops_SP);
     addCommand("fixX", &Py_ops_fixX);
     addCommand("fixY", &Py_ops_fixY);

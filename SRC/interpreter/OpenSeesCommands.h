@@ -64,6 +64,8 @@ UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 #include <elementAPI.h>
 #include <MachineBroker.h>
 #include "OpenSeesReliabilityCommands.h"
+#include <string>
+#include <vector>
 
 class OpenSeesCommands
 {
@@ -271,6 +273,19 @@ int OPS_nodeReaction();
 int OPS_nodeEigenvector();
 int OPS_getTime();
 int OPS_eleResponse();
+// Batch version of eleResponse, see eleGaussResponse in PythonWrapper.cpp
+int OPS_GetElementGaussResponse(const std::vector<int> &eleTags,
+                                const char **argv, int argc,
+                                std::vector<int> &sizes,
+                                std::vector<double> &data);
+// Gauss point values projected to nodes, see eleGaussToNodes in PythonWrapper.cpp
+int OPS_GetGaussToNodes(const std::vector<int> &eleTags,
+                        const char *variable,
+                        int fiber,
+                        std::vector<int> &nodeTags,
+                        std::vector<double> &values,
+                        int &numComp,
+                        int &skipped);
 int OPS_getLoadFactor();
 int OPS_printModelGID();
 int OPS_getCTestNorms();

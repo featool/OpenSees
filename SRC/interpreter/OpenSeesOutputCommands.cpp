@@ -53,6 +53,7 @@ UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 #include <ElementalLoad.h>
 #include <ElementalLoadIter.h>
 #include <Element.h>
+#include <classTags.h>
 #include <ElementIter.h>
 #include <CrdTransf.h>
 #include <SP_Constraint.h>
@@ -60,6 +61,7 @@ UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 #include <MP_Constraint.h>
 #include <MP_ConstraintIter.h>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <algorithm>
 #include <Recorder.h>
@@ -528,6 +530,247 @@ int OPS_eleResponse()
     }
     return 0;
 
+}
+
+// ---------------------------------------------------------------------------
+// Batch version of eleResponse: evaluate the same response arguments for a
+// list of elements and return the concatenated values.
+//
+//   sizes, data = ops.eleGaussResponse(eleTags, *responseArgs)
+//
+// responseArgs are exactly the arguments eleResponse() accepts after the tag,
+// e.g. "stresses", or "Material", 1, "fiber", 2, "stresses".  sizes[i] is the
+// number of doubles element i returned (0 if the element does not exist or
+// does not provide that response), and data holds the raw float64 values of
+// all elements in tag order.  Running the loop here instead of in Python
+// removes one interpreter round trip per element and per response.
+// ---------------------------------------------------------------------------
+int
+OPS_GetElementGaussResponse(const std::vector<int> &eleTags,
+                            const char **argv, int argc,
+                            std::vector<int> &sizes, std::vector<double> &data)
+{
+    Domain *theDomain = OPS_GetDomain();
+    if (theDomain == 0)
+        return -1;
+    if (argc < 1 || argv == 0)   // eleResponse needs at least one response argument
+        return -1;
+
+    sizes.clear();
+    data.clear();
+    sizes.reserve(eleTags.size());
+
+    for (std::size_t i = 0; i < eleTags.size(); i++) {
+        const Vector *resp = theDomain->getElementResponse(eleTags[i], argv, argc);
+        if (resp == 0) {
+            sizes.push_back(0);
+            continue;
+        }
+        const int size = resp->Size();
+        sizes.push_back(size);
+        for (int j = 0; j < size; j++)
+            data.push_back((*resp)(j));
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Gauss point values projected to nodes (eleGaussToNodes).
+//
+//   nodeTags, values = ops.eleGaussToNodes(eleTags, variable[, fiber])
+//
+// variable is the same keyword eleResponse() takes at the section level
+// ("stresses" / "strains").  fiber == 0 reads the section response, fiber > 0
+// reads "Material", gp, "fiber", fiber, variable at every gauss point.  The
+// gauss values are projected to the element nodes with the same "copy" weight
+// rules the Python implementation used, and nodes shared by several elements
+// are averaged, so the caller receives node values directly.
+// ---------------------------------------------------------------------------
+namespace {
+
+// gauss values (nGauss x ncomp) -> node values (nNodes x ncomp), copy weights
+static void
+projectGaussToNodeValues(const std::vector<double> &gauss, int nGauss, int ncomp,
+                         int nNodes, std::vector<double> &nodeValues)
+{
+    nodeValues.assign((std::size_t)nNodes * ncomp, 0.0);
+
+    // quad4/4gp、quad9/9gp: 1:1 拷贝
+    if ((nNodes == 4 && nGauss == 4) || (nNodes == 9 && nGauss == 9)) {
+        nodeValues = gauss;
+        return;
+    }
+    // tri3/1gp: 三个节点共用唯一 gauss 点
+    if (nNodes == 3 && nGauss == 1) {
+        for (int n = 0; n < 3; n++)
+            for (int c = 0; c < ncomp; c++)
+                nodeValues[(std::size_t)n * ncomp + c] = gauss[c];
+        return;
+    }
+    // tri3/3gp: 取相邻两点平均
+    if (nNodes == 3 && nGauss == 3) {
+        for (int c = 0; c < ncomp; c++) {
+            nodeValues[0 * ncomp + c] = 0.5 * gauss[1 * ncomp + c] + 0.5 * gauss[2 * ncomp + c];
+            nodeValues[1 * ncomp + c] = 0.5 * gauss[0 * ncomp + c] + 0.5 * gauss[2 * ncomp + c];
+            nodeValues[2 * ncomp + c] = 0.5 * gauss[0 * ncomp + c] + 0.5 * gauss[1 * ncomp + c];
+        }
+        return;
+    }
+    // tri3/4gp (ShellDKGT): N1<-G4, N2<-G3, N3<-G2
+    if (nNodes == 3 && nGauss == 4) {
+        for (int c = 0; c < ncomp; c++) {
+            nodeValues[0 * ncomp + c] = gauss[3 * ncomp + c];
+            nodeValues[1 * ncomp + c] = gauss[2 * ncomp + c];
+            nodeValues[2 * ncomp + c] = gauss[1 * ncomp + c];
+        }
+        return;
+    }
+    // 未知拓扑: 保持 0 (与 Python 权值矩阵为 None 的分支一致)
+}
+
+} // namespace
+
+int
+OPS_GetGaussToNodes(const std::vector<int> &eleTags, const char *variable, int fiber,
+                    std::vector<int> &nodeTags, std::vector<double> &values,
+                    int &numComp, int &skipped)
+{
+    nodeTags.clear();
+    values.clear();
+    numComp = 0;
+    skipped = 0;
+
+    Domain *theDomain = OPS_GetDomain();
+    if (theDomain == 0)
+        return -1;
+    if (variable == 0)
+        return -1;
+    if (strcmp(variable, "stresses") != 0 && strcmp(variable, "strains") != 0)
+        return -1;
+    if (fiber < 0)
+        return -1;
+
+    std::unordered_map<int, int> nodeRow;
+    std::vector<double> sums;
+    std::vector<int> counts;
+    std::vector<double> gauss, nodeValues;
+    int ncomp = 0;
+
+    char gpBuffer[16];
+    char fiberBuffer[16];
+    snprintf(fiberBuffer, sizeof(fiberBuffer), "%d", fiber);
+
+    for (std::size_t i = 0; i < eleTags.size(); i++) {
+        const int tag = eleTags[i];
+        Element *theEle = theDomain->getElement(tag);
+        if (theEle == 0) {
+            skipped++;
+            continue;
+        }
+        const ID &external = theEle->getExternalNodes();
+        const int nNodes = external.Size();
+        if (nNodes <= 0) {
+            skipped++;
+            continue;
+        }
+
+        gauss.clear();
+        int nGauss = 0;
+        int comp = 0;
+
+        if (fiber == 0) {
+            const char *argv[1] = {variable};
+            const Vector *resp = theDomain->getElementResponse(tag, argv, 1);
+            if (resp == 0 || resp->Size() == 0) {
+                skipped++;
+                continue;
+            }
+            comp = 8;  // 壳单元截面响应: 每个 gauss 点 8 个分量
+            if (resp->Size() % comp != 0) {
+                skipped++;
+                continue;
+            }
+            nGauss = resp->Size() / comp;
+            gauss.resize(resp->Size());
+            for (int k = 0; k < resp->Size(); k++)
+                gauss[k] = (*resp)(k);
+        } else {
+            // 和 Python 一样逐个 gauss 点读, 读到空响应为止
+            for (int gp = 1; gp <= 64; gp++) {
+                snprintf(gpBuffer, sizeof(gpBuffer), "%d", gp);
+                const char *argv[5] = {"Material", gpBuffer, "fiber", fiberBuffer, variable};
+                const Vector *resp = theDomain->getElementResponse(tag, argv, 5);
+                if (resp == 0 || resp->Size() == 0)
+                    break;
+                if (comp == 0)
+                    comp = resp->Size();
+                if (resp->Size() != comp) {
+                    gauss.clear();
+                    nGauss = 0;
+                    break;
+                }
+                for (int k = 0; k < resp->Size(); k++)
+                    gauss.push_back((*resp)(k));
+                nGauss = gp;
+            }
+            if (nGauss == 0) {  // 该单元没有这一层纤维
+                skipped++;
+                continue;
+            }
+        }
+
+        if (comp <= 0) {
+            skipped++;
+            continue;
+        }
+        if (ncomp == 0)
+            ncomp = comp;
+        if (comp != ncomp)
+            return -1;
+
+        // ShellMITC9 的 gauss 顺序与节点顺序不一致, 投影前先按节点顺序重排
+        if (nGauss == 9 && theEle->getClassTag() == ELE_TAG_ShellMITC9) {
+            std::vector<double> reordered(gauss.size());
+            const int perm[9] = {0, 2, 4, 6, 1, 3, 5, 7, 8};
+            for (int g = 0; g < 9; g++)
+                for (int c = 0; c < ncomp; c++)
+                    reordered[(std::size_t)g * ncomp + c] =
+                        gauss[(std::size_t)perm[g] * ncomp + c];
+            gauss.swap(reordered);
+        }
+
+        projectGaussToNodeValues(gauss, nGauss, ncomp, nNodes, nodeValues);
+
+        for (int n = 0; n < nNodes; n++) {
+            const int nodeTag = external(n);
+            std::unordered_map<int, int>::iterator it = nodeRow.find(nodeTag);
+            int row;
+            if (it == nodeRow.end()) {
+                row = (int)nodeTags.size();
+                nodeRow[nodeTag] = row;
+                nodeTags.push_back(nodeTag);
+                sums.resize((std::size_t)(row + 1) * ncomp, 0.0);
+                counts.push_back(0);
+            } else {
+                row = it->second;
+            }
+            for (int c = 0; c < ncomp; c++)
+                sums[(std::size_t)row * ncomp + c] +=
+                    nodeValues[(std::size_t)n * ncomp + c];
+            counts[row]++;
+        }
+    }
+
+    numComp = ncomp;
+    values.resize(nodeTags.size() * (std::size_t)ncomp);
+    for (std::size_t row = 0; row < nodeTags.size(); row++) {
+        if (counts[row] > 0) {
+            for (int c = 0; c < ncomp; c++)
+                values[row * ncomp + c] = sums[row * ncomp + c] / counts[row];
+        }
+    }
+    return 0;
 }
 
 int OPS_getLoadFactor()
