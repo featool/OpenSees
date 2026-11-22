@@ -1,9 +1,10 @@
 @echo off
 rem ============================================================
-rem  One-click build: profile -> conan -> configure -> build -> postbuild
+rem  One-click build: profile -> conan -> configure -> build
+rem                   -> postbuild -> install into PYTHON_DIR
 rem  Usage:  make.bat
 rem  Incremental rebuild after editing C++ sources: run 03-build.bat
-rem  (optionally 04-postbuild.bat) instead of this script.
+rem  (optionally 04-postbuild.bat / 05-install-python.bat) instead.
 rem ============================================================
 setlocal
 set "HERE=%~dp0"
@@ -18,9 +19,12 @@ call "%HERE%03-build.bat"
 if errorlevel 1 exit /b 1
 call "%HERE%04-postbuild.bat"
 if errorlevel 1 exit /b 1
+call "%HERE%05-install-python.bat"
+if errorlevel 1 exit /b 1
 
 echo.
 echo ============================================
 echo  BUILD COMPLETE
 echo  artifacts : %HERE%..\build\Release\
+echo  python    : %PYTHON_DIR%  ^(openseespy updated^)
 echo ============================================
