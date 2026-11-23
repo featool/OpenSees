@@ -1065,19 +1065,23 @@ static PyObject *Py_ops_eleGaussResponse(PyObject *self, PyObject *args)
 
 // C++ side gauss -> node projection.
 //
-//   nodeTags, values = ops.eleGaussToNodes(eleTags, variable[, fiber])
+//   nodeTags, values = ops.eleGaussToNodes(eleTags, variable[, fiber[, method]])
 //
 // variable : "stresses" | "strains" (same keyword as eleResponse)
 // fiber    : 0 (default) = section response, > 0 = fiber index
+// method   : "copy" (default) | "average" | "extrapolate", selects how the
+//            gauss point values are projected onto the nodes (see
+//            OPS_GetGaussToNodes).  The third argument may also be the method
+//            string, as in eleGaussToNodes(tags, "stresses", "extrapolate").
 // nodeTags : node tags in first-appearance order
 // values   : bytes, float64, one row of numComp components per node
 static PyObject *Py_ops_eleGaussToNodes(PyObject *self, PyObject *args)
 {
     const Py_ssize_t numArgs = PyTuple_Size(args);
-    if (numArgs < 2 || numArgs > 3) {
+    if (numArgs < 2 || numArgs > 4) {
 	PyErr_SetString(PyExc_TypeError,
 			"eleGaussToNodes() wants: "
-			"eleGaussToNodes(eleTags, variable[, fiber])");
+			"eleGaussToNodes(eleTags, variable[, fiber[, method]])");
 	return NULL;
     }
 
@@ -1093,14 +1097,33 @@ static PyObject *Py_ops_eleGaussToNodes(PyObject *self, PyObject *args)
 	return NULL;
 
     long fiber = 0;
-    if (numArgs == 3) {
-	PyObject *fiberObj = PyTuple_GetItem(args, 2);
-	fiber = PyLong_AsLong(fiberObj);
-	if ((fiber == -1 && PyErr_Occurred()) || fiber < 0) {
+    const char *method = "copy";
+    // third argument: fiber (int) or method (str); fourth argument: method
+    if (numArgs >= 3) {
+	PyObject *thirdObj = PyTuple_GetItem(args, 2);
+	if (PyUnicode_Check(thirdObj)) {
+	    method = PyUnicode_AsUTF8(thirdObj);
+	    if (method == NULL)
+		return NULL;
+	} else {
+	    fiber = PyLong_AsLong(thirdObj);
+	    if ((fiber == -1 && PyErr_Occurred()) || fiber < 0) {
+		PyErr_SetString(PyExc_TypeError,
+				"eleGaussToNodes(): fiber must be a non-negative integer");
+		return NULL;
+	    }
+	}
+    }
+    if (numArgs == 4) {
+	PyObject *methodObj = PyTuple_GetItem(args, 3);
+	if (!PyUnicode_Check(methodObj)) {
 	    PyErr_SetString(PyExc_TypeError,
-			    "eleGaussToNodes(): fiber must be a non-negative integer");
+			    "eleGaussToNodes(): method must be a string");
 	    return NULL;
 	}
+	method = PyUnicode_AsUTF8(methodObj);
+	if (method == NULL)
+	    return NULL;
     }
 
     PyObject *seq = PySequence_Fast(tagObj,
@@ -1128,14 +1151,18 @@ static PyObject *Py_ops_eleGaussToNodes(PyObject *self, PyObject *args)
     std::vector<double> values;
     int numComp = 0;
     int skipped = 0;
-    if (OPS_GetGaussToNodes(tags, variable, (int)fiber,
+    if (OPS_GetGaussToNodes(tags, variable, (int)fiber, method,
 			    nodeTags, values, numComp, skipped) < 0) {
+	if (PyErr_Occurred())
+	    return NULL;
 	PyErr_SetString(PyExc_RuntimeError,
 			"eleGaussToNodes(): failed to project the element responses");
 	return NULL;
     }
     (void)numComp;
-    (void)skipped;
+    if (skipped > 0)
+	opserr << "eleGaussToNodes(): " << skipped
+	       << " element(s) skipped (no response or unknown topology)" << endln;
 
     PyObject *nodeList = PyList_New((Py_ssize_t)nodeTags.size());
     if (nodeList == NULL)

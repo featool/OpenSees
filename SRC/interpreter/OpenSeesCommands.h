@@ -278,10 +278,12 @@ int OPS_GetElementGaussResponse(const std::vector<int> &eleTags,
                                 const char **argv, int argc,
                                 std::vector<int> &sizes,
                                 std::vector<double> &data);
-// Gauss point values projected to nodes, see eleGaussToNodes in PythonWrapper.cpp
+// Gauss point values projected to nodes, see eleGaussToNodes in PythonWrapper.cpp.
+// method: "copy" (default) | "average" | "extrapolate"
 int OPS_GetGaussToNodes(const std::vector<int> &eleTags,
                         const char *variable,
                         int fiber,
+                        const char *method,
                         std::vector<int> &nodeTags,
                         std::vector<double> &values,
                         int &numComp,

@@ -64,6 +64,8 @@ UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 #include <unordered_map>
 #include <set>
 #include <algorithm>
+#include <cctype>
+#include <string>
 #include <Recorder.h>
 #include <Pressure_Constraint.h>
 #include <vector>
@@ -578,63 +580,225 @@ OPS_GetElementGaussResponse(const std::vector<int> &eleTags,
 // ---------------------------------------------------------------------------
 // Gauss point values projected to nodes (eleGaussToNodes).
 //
-//   nodeTags, values = ops.eleGaussToNodes(eleTags, variable[, fiber])
+//   nodeTags, values = ops.eleGaussToNodes(eleTags, variable[, fiber[, method]])
 //
 // variable is the same keyword eleResponse() takes at the section level
 // ("stresses" / "strains").  fiber == 0 reads the section response, fiber > 0
-// reads "Material", gp, "fiber", fiber, variable at every gauss point.  The
-// gauss values are projected to the element nodes with the same "copy" weight
-// rules the Python implementation used, and nodes shared by several elements
-// are averaged, so the caller receives node values directly.
+// reads "Material", gp, "fiber", fiber, variable at every gauss point.
+//
+// method selects how the gauss point values reach the nodes (weight tables are
+// the ones opstool 1.0.26 uses in utils/ele_shape_func.py):
+//   "copy"        (default) 1:1 copy / neighbouring average, opstool "copy"
+//   "average"               integrate weight average, opstool "average"
+//   "extrapolate"           element shape function extrapolation, opstool
+//                           "extrapolate"; falls back to "copy" when the
+//                           topology has no extrapolation basis (1gp etc.)
+// Nodes shared by several elements are averaged arithmetically over the
+// elements that projected onto them, so the caller receives node values.
 // ---------------------------------------------------------------------------
 namespace {
 
-// gauss values (nGauss x ncomp) -> node values (nNodes x ncomp), copy weights
-static void
-projectGaussToNodeValues(const std::vector<double> &gauss, int nGauss, int ncomp,
-                         int nNodes, std::vector<double> &nodeValues)
-{
-    nodeValues.assign((std::size_t)nNodes * ncomp, 0.0);
+// Gauss point -> node projection methods (eleGaussToNodes' method argument)
+enum ProjectionMethod {
+    PROJECT_COPY = 0,         // 1:1 copy / neighbour average, opstool "copy"
+    PROJECT_AVERAGE = 1,      // integrate weight average, opstool "average"
+    PROJECT_EXTRAPOLATE = 2   // shape function extrapolation, opstool "extrapolate"
+};
 
-    // quad4/4gp、quad9/9gp: 1:1 拷贝
+// Parse the method argument, -1 when the name is not recognised.
+static int
+parseProjectionMethod(const char *method)
+{
+    if (method == 0 || method[0] == '\0')
+        return PROJECT_COPY;
+    std::string name(method);
+    for (std::size_t i = 0; i < name.size(); i++)
+        name[i] = (char)tolower((unsigned char)name[i]);
+    if (name == "copy")
+        return PROJECT_COPY;
+    if (name == "average" || name == "avg" || name == "ave")
+        return PROJECT_AVERAGE;
+    if (name == "extrapolate" || name == "extrap" || name == "extra")
+        return PROJECT_EXTRAPOLATE;
+    return -1;
+}
+
+// Integration weights of the gauss points, same values as opstool's gp_wts.
+static bool
+getGaussPointWeights(int nNodes, int nGauss, std::vector<double> &gpWeights)
+{
+    if (nNodes == 4 && nGauss == 4) {          // quad4, 2x2 gauss
+        gpWeights.assign(4, 1.0);
+        return true;
+    }
+    if (nNodes == 9 && nGauss == 9) {          // quad9, 3x3 gauss
+        const double w[9] = {25.0 / 81.0, 25.0 / 81.0, 25.0 / 81.0, 25.0 / 81.0,
+                             40.0 / 81.0, 40.0 / 81.0, 40.0 / 81.0, 40.0 / 81.0,
+                             64.0 / 81.0};
+        gpWeights.assign(w, w + 9);
+        return true;
+    }
+    if (nNodes == 3 && nGauss == 1) {          // tri3, 1 gauss
+        gpWeights.assign(1, 1.0);
+        return true;
+    }
+    if (nNodes == 3 && nGauss == 3) {          // tri3, 3 gauss
+        gpWeights.assign(3, 1.0 / 6.0);
+        return true;
+    }
+    if (nNodes == 3 && nGauss == 4) {          // ShellDKGT, 4 gauss
+        const double w[4] = {-9.0 / 16.0, 25.0 / 48.0, 25.0 / 48.0, 25.0 / 48.0};
+        gpWeights.assign(w, w + 4);
+        return true;
+    }
+    return false;
+}
+
+// Extrapolation weights (node = weights * gauss), opstool's "extrapolate".
+static bool
+getExtrapolationWeights(int nNodes, int nGauss, std::vector<double> &weights)
+{
+    // quad4/4gp: bilinear extrapolation from the 2x2 gauss points
+    static const double quad4[16] = {
+        1.8660254, -0.5, 0.1339746, -0.5,
+        -0.5, 1.8660254, -0.5, 0.1339746,
+        0.1339746, -0.5, 1.8660254, -0.5,
+        -0.5, 0.1339746, -0.5, 1.8660254};
+    // tri3/3gp: linear extrapolation to the vertices
+    static const double tri33[9] = {
+        0.261204, 0.369398, 0.369398,
+        0.328227, 0.207589, 0.464183,
+        0.328227, 0.464183, 0.207589};
+    // tri3/4gp (ShellDKGT)
+    static const double tri34[12] = {
+        0.240536, 0.179285, 0.179285, 0.400893,
+        0.231701, 0.172700, 0.386169, 0.209430,
+        0.231701, 0.386169, 0.172700, 0.209430};
+    // quad9/9gp: biquadratic extrapolation from the 3x3 gauss points
+    static const double quad9[81] = {
+        2.18693982, 0.27777778, 0.0352824, 0.27777778, -0.98588704,
+        -0.12522407, -0.12522407, -0.98588704, 0.44444444,
+        0.27777778, 2.18693982, 0.27777778, 0.0352824, -0.98588704,
+        -0.98588704, -0.12522407, -0.12522407, 0.44444444,
+        0.0352824, 0.27777778, 2.18693982, 0.27777778, -0.12522407,
+        -0.98588704, -0.98588704, -0.12522407, 0.44444444,
+        0.27777778, 0.0352824, 0.27777778, 2.18693982, -0.12522407,
+        -0.12522407, -0.98588704, -0.98588704, 0.44444444,
+        0.0, 0.0, 0.0, 0.0, 1.47883056, 0.0, 0.18783611, 0.0, -0.66666667,
+        0.0, 0.0, 0.0, 0.0, 0.0, 1.47883056, 0.0, 0.18783611, -0.66666667,
+        0.0, 0.0, 0.0, 0.0, 0.18783611, 0.0, 1.47883056, 0.0, -0.66666667,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.18783611, 0.0, 1.47883056, -0.66666667,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+
+    const double *table = 0;
+    std::size_t size = 0;
+    if (nNodes == 4 && nGauss == 4) {
+        table = quad4;
+        size = 16;
+    } else if (nNodes == 9 && nGauss == 9) {
+        table = quad9;
+        size = 81;
+    } else if (nNodes == 3 && nGauss == 3) {
+        table = tri33;
+        size = 9;
+    } else if (nNodes == 3 && nGauss == 4) {
+        table = tri34;
+        size = 12;
+    } else
+        return false;
+
+    weights.assign(table, table + size);
+    return true;
+}
+
+// (nNodes x nGauss) projection weights, false when the topology is unknown.
+static bool
+buildProjectionWeights(int nNodes, int nGauss, int method,
+                       std::vector<double> &weights)
+{
+    const std::size_t size = (std::size_t)nNodes * (std::size_t)nGauss;
+
+    if (method == PROJECT_AVERAGE) {
+        std::vector<double> gpWeights;
+        if (!getGaussPointWeights(nNodes, nGauss, gpWeights))
+            return false;
+        double total = 0.0;
+        for (int g = 0; g < nGauss; g++)
+            total += gpWeights[g];
+        if (total == 0.0)
+            return false;
+        weights.assign(size, 0.0);
+        for (int n = 0; n < nNodes; n++)
+            for (int g = 0; g < nGauss; g++)
+                weights[(std::size_t)n * nGauss + g] = gpWeights[g] / total;
+        return true;
+    }
+
+    if (method == PROJECT_EXTRAPOLATE &&
+        getExtrapolationWeights(nNodes, nGauss, weights))
+        return true;
+    // "extrapolate" without an extrapolation basis falls back to "copy"
+
+    // copy: quad4/quad9 1:1 copy; tri3/1gp three nodes share the single gauss
+    // point; tri3/3gp average the two neighbouring points
     if ((nNodes == 4 && nGauss == 4) || (nNodes == 9 && nGauss == 9)) {
-        nodeValues = gauss;
-        return;
+        weights.assign(size, 0.0);
+        for (int i = 0; i < nNodes; i++)
+            weights[(std::size_t)i * nGauss + i] = 1.0;
+        return true;
     }
-    // tri3/1gp: 三个节点共用唯一 gauss 点
     if (nNodes == 3 && nGauss == 1) {
-        for (int n = 0; n < 3; n++)
-            for (int c = 0; c < ncomp; c++)
-                nodeValues[(std::size_t)n * ncomp + c] = gauss[c];
-        return;
+        weights.assign(3, 1.0);
+        return true;
     }
-    // tri3/3gp: 取相邻两点平均
     if (nNodes == 3 && nGauss == 3) {
-        for (int c = 0; c < ncomp; c++) {
-            nodeValues[0 * ncomp + c] = 0.5 * gauss[1 * ncomp + c] + 0.5 * gauss[2 * ncomp + c];
-            nodeValues[1 * ncomp + c] = 0.5 * gauss[0 * ncomp + c] + 0.5 * gauss[2 * ncomp + c];
-            nodeValues[2 * ncomp + c] = 0.5 * gauss[0 * ncomp + c] + 0.5 * gauss[1 * ncomp + c];
-        }
-        return;
+        weights.assign(size, 0.0);
+        for (int n = 0; n < 3; n++)
+            for (int g = 0; g < 3; g++)
+                if (n != g)
+                    weights[(std::size_t)n * 3 + g] = 0.5;
+        return true;
     }
     // tri3/4gp (ShellDKGT): N1<-G4, N2<-G3, N3<-G2
     if (nNodes == 3 && nGauss == 4) {
-        for (int c = 0; c < ncomp; c++) {
-            nodeValues[0 * ncomp + c] = gauss[3 * ncomp + c];
-            nodeValues[1 * ncomp + c] = gauss[2 * ncomp + c];
-            nodeValues[2 * ncomp + c] = gauss[1 * ncomp + c];
-        }
-        return;
+        weights.assign(size, 0.0);
+        weights[0 * 4 + 3] = 1.0;
+        weights[1 * 4 + 2] = 1.0;
+        weights[2 * 4 + 1] = 1.0;
+        return true;
     }
-    // 未知拓扑: 保持 0 (与 Python 权值矩阵为 None 的分支一致)
+    return false;
+}
+
+// gauss values (nGauss x ncomp) -> node values (nNodes x ncomp)
+static bool
+projectGaussToNodeValues(const std::vector<double> &gauss, int nGauss, int ncomp,
+                         int nNodes, int method, std::vector<double> &nodeValues)
+{
+    std::vector<double> weights;
+    if (!buildProjectionWeights(nNodes, nGauss, method, weights))
+        return false;
+
+    nodeValues.assign((std::size_t)nNodes * ncomp, 0.0);
+    for (int n = 0; n < nNodes; n++) {
+        for (int g = 0; g < nGauss; g++) {
+            const double w = weights[(std::size_t)n * nGauss + g];
+            if (w == 0.0)
+                continue;
+            for (int c = 0; c < ncomp; c++)
+                nodeValues[(std::size_t)n * ncomp + c] +=
+                    w * gauss[(std::size_t)g * ncomp + c];
+        }
+    }
+    return true;
 }
 
 } // namespace
 
 int
 OPS_GetGaussToNodes(const std::vector<int> &eleTags, const char *variable, int fiber,
-                    std::vector<int> &nodeTags, std::vector<double> &values,
-                    int &numComp, int &skipped)
+                    const char *method, std::vector<int> &nodeTags,
+                    std::vector<double> &values, int &numComp, int &skipped)
 {
     nodeTags.clear();
     values.clear();
@@ -650,6 +814,13 @@ OPS_GetGaussToNodes(const std::vector<int> &eleTags, const char *variable, int f
         return -1;
     if (fiber < 0)
         return -1;
+    const int projection = parseProjectionMethod(method);
+    if (projection < 0) {
+        opserr << "eleGaussToNodes() - unknown projection method: "
+               << (method ? method : "") << endln;
+        opserr << "  valid methods are copy, average and extrapolate" << endln;
+        return -1;
+    }
 
     std::unordered_map<int, int> nodeRow;
     std::vector<double> sums;
@@ -740,7 +911,11 @@ OPS_GetGaussToNodes(const std::vector<int> &eleTags, const char *variable, int f
             gauss.swap(reordered);
         }
 
-        projectGaussToNodeValues(gauss, nGauss, ncomp, nNodes, nodeValues);
+        if (!projectGaussToNodeValues(gauss, nGauss, ncomp, nNodes, projection,
+                                      nodeValues)) {
+            skipped++;
+            continue;
+        }
 
         for (int n = 0; n < nNodes; n++) {
             const int nodeTag = external(n);
